@@ -1,0 +1,23 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# Virtual environment
+venv/
+ENV/
+env/
+
+# VS Code settings
+.vscode/
+
+# Other
+*.sqlite3
+instance/
+
+# Whisper cached models
+cached_models/
+
+#static files
+static/
