@@ -8,3 +8,4 @@ schedule==1.2.2
 Werkzeug==2.3.7
 SpeechRecognition==3.10.0
 gunicorn==21.2.0
+python-dotenv==1.0.0
