@@ -16,7 +16,6 @@ from api.services.whisper_functions import (
     get_whisper_model
 )
 from api.services.audio_service import extract_audio_from_video, convert_audio_format, split_audio
-from api.services.transcription_service import process_pure_tamil_from_audio, transcribe_with_whisper
 from api.services.translation_service import translate_text
 from api.services.tanglish_service import tamil_to_tanglish, contains_tamil_script
 from api.services.srt_service import generate_all_srt_files_improved
