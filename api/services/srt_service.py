@@ -7,56 +7,13 @@ from faster_whisper import WhisperModel
 from pydub import AudioSegment
 import moviepy.editor as mp
 
-# Global model instance to avoid reloading
-_whisper_model = None
-
-def get_whisper_model():
-    """Get or create Whisper model instance"""
-    global _whisper_model
-    if _whisper_model is None:
-        _whisper_model = WhisperModel("base", device="cpu", compute_type="int8")
-    return _whisper_model
-
-def format_timestamp(seconds):
-    """Convert seconds to SRT timestamp format (HH:MM:SS,mmm)"""
-    # Ensure we don't have negative timestamps
-    seconds = max(0, seconds)
-    hours = int(seconds // 3600)
-    minutes = int((seconds % 3600) // 60)
-    secs = int(seconds % 60)
-    milliseconds = int((seconds % 1) * 1000)
-    return f"{hours:02d}:{minutes:02d}:{secs:02d},{milliseconds:03d}"
-
-def get_video_duration(video_path):
-    """Get video duration in seconds"""
-    try:
-        with mp.VideoFileClip(video_path) as video:
-            return video.duration
-    except Exception as e:
-        print(f"Error getting video duration: {e}")
-        return None
-
-def get_audio_video_offset(video_path, audio_path):
-    """Calculate any offset between extracted audio and video"""
-    try:
-        # Get video duration
-        video_duration = get_video_duration(video_path)
-        
-        # Get audio duration
-        audio = AudioSegment.from_file(audio_path)
-        audio_duration = len(audio) / 1000.0
-        
-        # Calculate offset (usually minimal, but can exist)
-        offset = abs(video_duration - audio_duration) if video_duration else 0
-        
-        print(f"Video duration: {video_duration}s, Audio duration: {audio_duration}s, Offset: {offset}s")
-        
-        # If there's a significant offset, we might need to adjust
-        return min(offset, 0.5)  # Cap offset at 0.5 seconds
-        
-    except Exception as e:
-        print(f"Error calculating audio-video offset: {e}")
-        return 0
+from api.services.whisper_functions import (
+    get_whisper_model,
+    format_timestamp,
+    get_video_duration,
+    get_audio_video_offset,
+    generate_precise_timed_segments
+)
 
 def split_text_into_segments(text, max_chars=60, max_words=8):
     """Split long text into smaller segments for subtitles with better readability"""
@@ -123,110 +80,6 @@ def split_text_into_segments(text, max_chars=60, max_words=8):
     
     return [seg.strip() for seg in segments if seg.strip()]
 
-def generate_precise_timed_segments(audio_path, video_path, language="ta"):
-    """Generate precise timed segments using Whisper with video synchronization"""
-    try:
-        model = get_whisper_model()
-        
-        # Calculate any audio-video offset
-        av_offset = get_audio_video_offset(video_path, audio_path)
-        
-        print(f"Generating precise timing for language: {language}")
-        
-        # Use optimal parameters for precise timing
-        segments, info = model.transcribe(
-            audio_path, 
-            language=language, 
-            word_timestamps=True,
-            vad_filter=True,
-            vad_parameters=dict(
-                min_silence_duration_ms=200,  # More sensitive silence detection
-                speech_pad_ms=50  # Less padding for tighter timing
-            ),
-            beam_size=3,  # Balanced beam search
-            best_of=3,
-            temperature=0.0,  # Deterministic
-            compression_ratio_threshold=2.4,
-            log_prob_threshold=-1.0,
-            no_speech_threshold=0.4,  # More permissive for continuous speech
-            initial_prompt=None  # Let Whisper auto-detect
-        )
-        
-        timed_segments = []
-        min_segment_duration = 0.8  # Minimum segment duration
-        max_segment_duration = 6.0  # Maximum segment duration
-        
-        for segment in segments:
-            duration = segment.end - segment.start
-            
-            # Skip very short segments
-            if duration < min_segment_duration:
-                continue
-            
-            # Clean up the text
-            text = segment.text.strip()
-            if not text or len(text) < 2:
-                continue
-            
-            # Apply audio-video offset correction
-            start_time = max(0, segment.start - av_offset)
-            end_time = segment.end - av_offset
-            
-            # Ensure reasonable duration bounds
-            if end_time - start_time > max_segment_duration:
-                end_time = start_time + max_segment_duration
-            
-            timed_segments.append({
-                'start': start_time,
-                'end': end_time,
-                'text': text,
-                'confidence': getattr(segment, 'avg_logprob', 0),
-                'word_count': len(text.split())
-            })
-        
-        # Sort by start time
-        timed_segments.sort(key=lambda x: x['start'])
-        
-        # Post-process to fix overlaps and ensure proper gaps
-        cleaned_segments = []
-        min_gap = 0.1  # 100ms minimum gap between segments
-        
-        for i, segment in enumerate(timed_segments):
-            if i == 0:
-                cleaned_segments.append(segment)
-                continue
-            
-            prev_segment = cleaned_segments[-1]
-            
-            # Fix overlaps
-            if segment['start'] <= prev_segment['end']:
-                # Calculate new start time with minimum gap
-                new_start = prev_segment['end'] + min_gap
-                
-                # If adjustment would make segment too short, merge with previous
-                if segment['end'] - new_start < min_segment_duration:
-                    # Extend previous segment
-                    prev_segment['end'] = segment['end']
-                    prev_segment['text'] += " " + segment['text']
-                    continue
-                else:
-                    segment['start'] = new_start
-            
-            cleaned_segments.append(segment)
-        
-        print(f"Generated {len(cleaned_segments)} precise timed segments")
-        
-        # Debug: Show first few segments
-        for i, seg in enumerate(cleaned_segments[:3]):
-            print(f"  Segment {i+1}: {seg['start']:.2f}s-{seg['end']:.2f}s ({seg['end']-seg['start']:.2f}s): '{seg['text'][:40]}...'")
-        
-        return cleaned_segments
-    
-    except Exception as e:
-        print(f"Error getting precise timed segments: {e}")
-        import traceback
-        traceback.print_exc()
-        return []
 
 def create_smart_fallback_segments(audio_path, video_path, text):
     """Create segments with smart estimated timing when Whisper fails"""
@@ -474,12 +327,12 @@ def generate_all_srt_files_improved(upload_dir, video_path, wav_audio_path, resu
         base_timed_segments = generate_precise_timed_segments(wav_audio_path, video_path, language="ta")
         
         # If Whisper timing fails, use smart fallback
-        if not base_timed_segments and results['pure_tamil']:
+        if not base_timed_segments and results['tanglish_tamil']:
             print("Whisper timing failed, using smart fallback method...")
             base_timed_segments = create_smart_fallback_segments(
                 wav_audio_path, 
                 video_path,
-                results['pure_tamil']
+                results['tanglish_tamil']
             )
         
         if not base_timed_segments:
@@ -489,24 +342,24 @@ def generate_all_srt_files_improved(upload_dir, video_path, wav_audio_path, resu
         print(f"Using {len(base_timed_segments)} base timing segments")
         print(f"Time range: {base_timed_segments[0]['start']:.2f}s to {base_timed_segments[-1]['end']:.2f}s")
         
-        # Generate SRT for Pure Tamil (use base segments with original Tamil text)
-        if results['pure_tamil']:
-            print("\n--- Generating Tamil SRT ---")
+
+        if results['tanglish_tamil']:
+            print("\n--- Generating Tanglish Tamil SRT ---")
             # Re-align Tamil text to ensure consistency
-            tamil_aligned_segments = align_text_to_timing(
+            tanglish_tamil_aligned_segments = align_text_to_timing(
                 base_timed_segments, 
-                results['pure_tamil'], 
+                results['tanglish_tamil'], 
                 "ta"
             )
             
-            if tamil_aligned_segments:
-                tamil_srt_content = create_srt_content(tamil_aligned_segments)
-                if tamil_srt_content:
-                    tamil_srt_path = os.path.join(upload_dir, "tamil_subtitles.srt")
-                    with open(tamil_srt_path, "w", encoding="utf-8") as f:
-                        f.write(tamil_srt_content)
-                    srt_files['tamil'] = tamil_srt_path
-                    print("✓ Generated Tamil SRT file")
+            if tanglish_tamil_aligned_segments:
+                tanglish_tamil_srt_content = create_srt_content(tanglish_tamil_aligned_segments)
+                if tanglish_tamil_srt_content:
+                    tanglish_tamil_srt_path = os.path.join(upload_dir, "tanglish_tamil_subtitles.srt")
+                    with open(tanglish_tamil_srt_path, "w", encoding="utf-8") as f:
+                        f.write(tanglish_tamil_srt_content)
+                    srt_files['tanglish_tamil'] = tanglish_tamil_srt_path
+                    print("✓ Generated Tanglish Tamil SRT file")
         
         # Generate SRT for English
         if results['english']:
@@ -527,40 +380,40 @@ def generate_all_srt_files_improved(upload_dir, video_path, wav_audio_path, resu
                     print("✓ Generated English SRT file")
         
         # Generate SRT for Tanglish
-        if results['tanglish'] and results['tanglish'] != "Tamil transcription failed":
+        if results['tanglish_english'] and results['tanglish_english'] != "Tanglish-english transcription failed":
             print("\n--- Generating Tanglish SRT ---")
-            tanglish_aligned_segments = align_text_to_timing(
+            tanglish_english_aligned_segments = align_text_to_timing(
                 base_timed_segments, 
-                results['tanglish'], 
-                "tanglish"
+                results['tanglish_english'], 
+                "tanglish_english"
             )
             
-            if tanglish_aligned_segments:
-                tanglish_srt_content = create_srt_content(tanglish_aligned_segments)
-                if tanglish_srt_content:
-                    tanglish_srt_path = os.path.join(upload_dir, "tanglish_subtitles.srt")
-                    with open(tanglish_srt_path, "w", encoding="utf-8") as f:
-                        f.write(tanglish_srt_content)
-                    srt_files['tanglish'] = tanglish_srt_path
-                    print("✓ Generated Tanglish SRT file")
+            if tanglish_english_aligned_segments:
+                tanglish_english_srt_content = create_srt_content(tanglish_english_aligned_segments)
+                if tanglish_english_srt_content:
+                    tanglish_english_srt_path = os.path.join(upload_dir, "tanglish_english_subtitles.srt")
+                    with open(tanglish_english_srt_path, "w", encoding="utf-8") as f:
+                        f.write(tanglish_english_srt_content)
+                    srt_files['tanglish_english'] = tanglish_english_srt_path
+                    print("✓ Generated Tanglish-English SRT file")
         
         # Generate SRT for Standard Tamil
-        if results['standard_tamil']:
-            print("\n--- Generating Standard Tamil SRT ---")
-            standard_tamil_aligned_segments = align_text_to_timing(
+        if results['tamil']:
+            print("\n--- Generating Tamil SRT ---")
+            tamil_aligned_segments = align_text_to_timing(
                 base_timed_segments, 
-                results['standard_tamil'], 
+                results['tamil'], 
                 "ta"
             )
             
-            if standard_tamil_aligned_segments:
-                standard_tamil_srt_content = create_srt_content(standard_tamil_aligned_segments)
-                if standard_tamil_srt_content:
-                    standard_tamil_srt_path = os.path.join(upload_dir, "standard_tamil_subtitles.srt")
-                    with open(standard_tamil_srt_path, "w", encoding="utf-8") as f:
-                        f.write(standard_tamil_srt_content)
-                    srt_files['standard_tamil'] = standard_tamil_srt_path
-                    print("✓ Generated Standard Tamil SRT file")
+            if tamil_aligned_segments:
+                tamil_srt_content = create_srt_content(tamil_aligned_segments)
+                if tamil_srt_content:
+                    tamil_srt_path = os.path.join(upload_dir, "tamil_subtitles.srt")
+                    with open(tamil_srt_path, "w", encoding="utf-8") as f:
+                        f.write(tamil_srt_content)
+                    srt_files['tamil'] = tamil_srt_path
+                    print("✓ Generated Tamil SRT file")
         
         print(f"\n=== Successfully generated {len(srt_files)} synchronized SRT files ===")
         

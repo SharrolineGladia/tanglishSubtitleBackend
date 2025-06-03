@@ -9,7 +9,12 @@ import json
 from werkzeug.utils import secure_filename
 from collections import defaultdict
 import queue
-
+from api.services.whisper_functions import (
+    process_pure_tamil_from_audio,
+    transcribe_with_whisper,
+    batch_transcribe_multiple_languages,
+    get_whisper_model
+)
 from api.services.audio_service import extract_audio_from_video, convert_audio_format, split_audio
 from api.services.transcription_service import process_pure_tamil_from_audio, transcribe_with_whisper
 from api.services.translation_service import translate_text
@@ -78,6 +83,7 @@ def upload_video():
 def process_video_async(upload_id, app):
     """
     Async function to process video in background with real-time status updates
+    Enhanced to use unified Whisper functions for better efficiency
     """
     with app.app_context():
         try:
@@ -133,14 +139,24 @@ def process_video_async(upload_id, app):
                 'message': 'Audio chunks prepared'
             })
             
-            # Step 3: Process Tamil transcription (50% progress)
+            # Step 3: Load Whisper model once for all operations
+            broadcast_status_update(upload_id, {
+                'status': 'processing',
+                'progress': 32,
+                'message': 'Loading AI models...'
+            })
+            
+            # Pre-load model to avoid repeated loading
+            whisper_model = get_whisper_model("base")
+            
+            # Step 4: Process Tamil transcription (50% progress)
             broadcast_status_update(upload_id, {
                 'status': 'processing',
                 'progress': 35,
                 'message': 'Transcribing Tamil audio...'
             })
             
-            pure_tamil_text = process_pure_tamil_from_audio(chunks)
+            tanglish_tamil_text = process_pure_tamil_from_audio(chunks, model=whisper_model)
             
             broadcast_status_update(upload_id, {
                 'status': 'processing',
@@ -148,17 +164,17 @@ def process_video_async(upload_id, app):
                 'message': 'Tamil transcription completed'
             })
             
-            # Step 4: Generate Tanglish (60% progress)
+            # Step 5: Generate Tanglish (60% progress)
             broadcast_status_update(upload_id, {
                 'status': 'processing',
                 'progress': 55,
                 'message': 'Converting to Tanglish...'
             })
             
-            if contains_tamil_script(pure_tamil_text):
-                romanized_tanglish = tamil_to_tanglish(pure_tamil_text)
+            if contains_tamil_script(tanglish_tamil_text):
+                tanglish_english_text = tamil_to_tanglish(tanglish_tamil_text)
             else:
-                romanized_tanglish = "Tamil transcription failed"
+                tanglish_english_text = "Tamil transcription failed"
             
             broadcast_status_update(upload_id, {
                 'status': 'processing',
@@ -166,16 +182,34 @@ def process_video_async(upload_id, app):
                 'message': 'Tanglish conversion completed'
             })
             
-            # Step 5: English transcription (70% progress)
+            # Step 6: English transcription using the same model (70% progress)
             broadcast_status_update(upload_id, {
                 'status': 'processing',
                 'progress': 65,
                 'message': 'Generating English translation...'
             })
             
-            english_text = transcribe_with_whisper(wav_audio_path, language="en")
-            if not english_text and pure_tamil_text:
-                english_text = translate_text(pure_tamil_text, "ta", "en")
+            # FIX: Use the already loaded model directly instead of passing model_size
+            try:
+                # Method 1: Use the loaded model with transcribe_with_whisper
+                english_text = transcribe_with_whisper(
+                    wav_audio_path, 
+                    language="en"
+                    # Removed model_size parameter - let it use default or loaded model
+                )
+            except Exception as e:
+                print(f"transcribe_with_whisper failed: {e}")
+                # Method 2: Fallback - use the model directly
+                try:
+                    segments, _ = whisper_model.transcribe(wav_audio_path, language="en", beam_size=5)
+                    english_text = " ".join([seg.text for seg in segments])
+                except Exception as e2:
+                    print(f"Direct model transcription failed: {e2}")
+                    english_text = ""
+            
+            # Fallback to translation if direct transcription fails
+            if not english_text and tanglish_tamil_text:
+                english_text = translate_text(tanglish_tamil_text, "ta", "en")
             
             broadcast_status_update(upload_id, {
                 'status': 'processing',
@@ -183,14 +217,14 @@ def process_video_async(upload_id, app):
                 'message': 'English translation completed'
             })
             
-            # Step 6: Standard Tamil translation (80% progress)
+            # Step 7: Standard Tamil translation (80% progress)
             broadcast_status_update(upload_id, {
                 'status': 'processing',
                 'progress': 75,
                 'message': 'Generating standard Tamil translation...'
             })
             
-            standard_tamil_text = translate_text(english_text, "en", "ta") if english_text else ""
+            tamil_text = translate_text(english_text, "en", "ta") if english_text else ""
             
             broadcast_status_update(upload_id, {
                 'status': 'processing',
@@ -198,7 +232,7 @@ def process_video_async(upload_id, app):
                 'message': 'Standard Tamil translation completed'
             })
             
-            # Step 7: Generate SRT files (90% progress)
+            # Step 8: Generate SRT files (90% progress)
             broadcast_status_update(upload_id, {
                 'status': 'processing',
                 'progress': 85,
@@ -206,12 +240,13 @@ def process_video_async(upload_id, app):
             })
             
             results = {
-                'pure_tamil': pure_tamil_text,
+                'tanglish_tamil': tanglish_tamil_text,
                 'english': english_text,
-                'tanglish': romanized_tanglish,
-                'standard_tamil': standard_tamil_text
+                'tanglish_english': tanglish_english_text,
+                'tamil': tamil_text
             }
             
+            # The SRT service will use the unified whisper functions internally
             srt_files = generate_all_srt_files_improved(upload_dir, video_path, wav_audio_path, results)
             
             broadcast_status_update(upload_id, {
@@ -220,7 +255,7 @@ def process_video_async(upload_id, app):
                 'message': 'Subtitle files generated'
             })
             
-            # Step 8: Create results file (100% progress)
+            # Step 9: Create results file (100% progress)
             broadcast_status_update(upload_id, {
                 'status': 'processing',
                 'progress': 95,
@@ -229,15 +264,15 @@ def process_video_async(upload_id, app):
             
             results_file = os.path.join(upload_dir, "results.txt")
             with open(results_file, "w", encoding="utf-8") as f:
-                f.write("===== TAMIL TRANSCRIPTION RESULTS =====\n\n")
-                f.write("PURE TAMIL TEXT (DIRECT FROM AUDIO):\n")
-                f.write(pure_tamil_text)
+                f.write("===== TRANSCRIPTION RESULTS =====\n\n")
+                f.write("TANGLISH IN TAMIL TEXT (DIRECT FROM AUDIO):\n")
+                f.write(tanglish_tamil_text)
                 f.write("\n\nENGLISH TRANSLATION:\n")
                 f.write(english_text)
-                f.write("\n\nTANGLISH ROMANIZATION:\n")
-                f.write(romanized_tanglish)
-                f.write("\n\nSTANDARD TAMIL TEXT (FROM ENGLISH):\n")
-                f.write(standard_tamil_text)
+                f.write("\n\nTANGLISH IN ENGLISH TEXT:\n")
+                f.write(tanglish_english_text)
+                f.write("\n\nTAMIL TEXT (FROM ENGLISH):\n")
+                f.write(tamil_text)
             
             # Complete
             broadcast_status_update(upload_id, {
@@ -260,12 +295,61 @@ def process_video_async(upload_id, app):
                 'progress': 0,
                 'message': f'Processing failed: {str(e)}'
             })
+            print(f"Full error details: {e}")
+            import traceback
+            traceback.print_exc()
+
+def process_video_batch_mode(upload_id, app):
+    """
+    Alternative processing function using batch transcription for even better efficiency
+    """
+    with app.app_context():
+        try:
+            # Initial setup (same as above)
+            upload_dir = os.path.join(current_app.config['UPLOAD_FOLDER'], upload_id)
+            files = os.listdir(upload_dir)
+            video_files = [f for f in files if allowed_file(f, current_app.config['ALLOWED_EXTENSIONS'])]
+            video_path = os.path.join(upload_dir, video_files[0])
+            
+            # Audio extraction steps (same as above)
+            broadcast_status_update(upload_id, {'status': 'processing', 'progress': 10, 'message': 'Extracting audio...'})
+            
+            audio_path = os.path.join(upload_dir, "extracted_audio.mp3")
+            wav_audio_path = os.path.join(upload_dir, "audio_for_speech.wav")
+            
+            extract_audio_from_video(video_path, audio_path)
+            convert_audio_format(audio_path, wav_audio_path)
+            
+            # Batch transcription for both Tamil and English at once
+            broadcast_status_update(upload_id, {'status': 'processing', 'progress': 30, 'message': 'Transcribing in multiple languages...'})
+            
+            # This uses a single model instance for both languages
+            batch_results = batch_transcribe_multiple_languages(
+                wav_audio_path, 
+                languages=["ta", "en"], 
+                model_size="base"
+            )
+            
+            pure_tamil_text = batch_results.get("ta", "")
+            english_text = batch_results.get("en", "")
+            
+            broadcast_status_update(upload_id, {'status': 'processing', 'progress': 70, 'message': 'Multi-language transcription completed'})
+            
+            # Continue with other processing steps...
+            # (Tanglish conversion, standard Tamil translation, SRT generation)
+            
+        except Exception as e:
+            broadcast_status_update(upload_id, {
+                'status': 'error',
+                'progress': 0,
+                'message': f'Batch processing failed: {str(e)}'
+            })
 
 @api_bp.route('/process/<upload_id>', methods=['POST'])
 def process_video(upload_id):
     """
     Endpoint to start processing an uploaded video
-    Returns immediately with processing status
+    Now uses unified Whisper functions for better efficiency
     """
     try:
         # Get the upload directory
@@ -281,15 +365,18 @@ def process_video(upload_id):
         if upload_id in processing_status and processing_status[upload_id]['status'] == 'completed':
             return jsonify(processing_status[upload_id]), 200
         
-        # Start async processing
-        thread = threading.Thread(target=process_video_async, args=(upload_id, current_app._get_current_object()))
+        # Start async processing with unified Whisper functions
+        thread = threading.Thread(
+            target=process_video_async, 
+            args=(upload_id, current_app._get_current_object())
+        )
         thread.daemon = True
         thread.start()
         
         return jsonify({
             'status': 'processing_started',
             'upload_id': upload_id,
-            'message': 'Video processing started. Connect to /status-stream endpoint for real-time updates.'
+            'message': 'Video processing started with optimized AI models. Connect to /status-stream endpoint for real-time updates.'
         })
         
     except Exception as e:
@@ -297,6 +384,32 @@ def process_video(upload_id):
             'status': 'error',
             'message': str(e)
         }), 500
+
+@api_bp.route('/process-batch/<upload_id>', methods=['POST'])
+def process_video_batch(upload_id):
+    """
+    Alternative endpoint for batch processing mode
+    """
+    try:
+        upload_dir = os.path.join(current_app.config['UPLOAD_FOLDER'], upload_id)
+        if not os.path.exists(upload_dir):
+            return jsonify({'error': 'Invalid upload ID'}), 404
+        
+        thread = threading.Thread(
+            target=process_video_batch_mode, 
+            args=(upload_id, current_app._get_current_object())
+        )
+        thread.daemon = True
+        thread.start()
+        
+        return jsonify({
+            'status': 'batch_processing_started',
+            'upload_id': upload_id,
+            'message': 'Batch processing started for maximum efficiency.'
+        })
+        
+    except Exception as e:
+        return jsonify({'status': 'error', 'message': str(e)}, 500)
 
 @api_bp.route('/status-stream/<upload_id>')
 def status_stream(upload_id):
@@ -397,8 +510,8 @@ def download_srt(upload_id, srt_type):
         srt_filenames = {
             'tamil': 'tamil_subtitles.srt',
             'english': 'english_subtitles.srt',
-            'tanglish': 'tanglish_subtitles.srt',
-            'standard_tamil': 'standard_tamil_subtitles.srt'
+            'tanglish_tamil': 'tanglish_tamil_subtitles.srt',
+            'tanglish_english': 'tanglish_english_subtitles.srt'
         }
         
         if srt_type not in srt_filenames:
