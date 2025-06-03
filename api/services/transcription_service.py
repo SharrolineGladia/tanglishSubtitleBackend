@@ -11,7 +11,7 @@ from faster_whisper import WhisperModel
 from googletrans import Translator
 
 
-def transcribe_tamil_audio(audio_path, model=None):
+def transcribe_tamil_audio(audio_path, model=None):    
     recognizer = sr.Recognizer()
 
     with sr.AudioFile(audio_path) as source:

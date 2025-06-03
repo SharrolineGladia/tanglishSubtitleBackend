@@ -1,24 +1,45 @@
-# api/routes.py - Fixed version with proper application context handling
 
-from flask import Blueprint, request, jsonify, current_app, send_file
+from flask import Blueprint, request, jsonify, current_app, send_file, Response
 import os
 import uuid
 import time
 import zipfile
 import threading
+import json
 from werkzeug.utils import secure_filename
+from collections import defaultdict
+import queue
 
 from api.services.audio_service import extract_audio_from_video, convert_audio_format, split_audio
 from api.services.transcription_service import process_pure_tamil_from_audio, transcribe_with_whisper
 from api.services.translation_service import translate_text
 from api.services.tanglish_service import tamil_to_tanglish, contains_tamil_script
-from api.services.srt_service import generate_all_srt_files_improved  # Updated import
+from api.services.srt_service import generate_all_srt_files_improved
 from utils.file_utils import allowed_file, cleanup_temp_files
 
 api_bp = Blueprint('api', __name__)
 
-# Store processing status
+# Store processing status and SSE clients
 processing_status = {}
+sse_clients = defaultdict(list)  # upload_id -> list of client queues
+
+def broadcast_status_update(upload_id, status_data):
+    """Broadcast status update to all SSE clients for this upload_id"""
+    processing_status[upload_id] = status_data
+    
+    # Send to all connected SSE clients for this upload_id
+    if upload_id in sse_clients:
+        disconnected_clients = []
+        for client_queue in sse_clients[upload_id]:
+            try:
+                client_queue.put(status_data, timeout=1)
+            except:
+                # Client disconnected, mark for removal
+                disconnected_clients.append(client_queue)
+        
+        # Remove disconnected clients
+        for client in disconnected_clients:
+            sse_clients[upload_id].remove(client)
 
 @api_bp.route('/upload', methods=['POST'])
 def upload_video():
@@ -56,11 +77,16 @@ def upload_video():
 
 def process_video_async(upload_id, app):
     """
-    Async function to process video in background with proper app context
+    Async function to process video in background with real-time status updates
     """
-    with app.app_context():  # Create application context for the background thread
+    with app.app_context():
         try:
-            processing_status[upload_id] = {'status': 'processing', 'progress': 0, 'message': 'Starting processing...'}
+            # Initial status
+            broadcast_status_update(upload_id, {
+                'status': 'processing', 
+                'progress': 0, 
+                'message': 'Starting processing...'
+            })
             
             # Get the upload directory
             upload_dir = os.path.join(current_app.config['UPLOAD_FOLDER'], upload_id)
@@ -74,46 +100,111 @@ def process_video_async(upload_id, app):
             video_path = os.path.join(upload_dir, video_files[0])
             
             # Step 1: Extract and prepare audio (20% progress)
-            processing_status[upload_id]['message'] = 'Extracting audio from video...'
+            broadcast_status_update(upload_id, {
+                'status': 'processing',
+                'progress': 10,
+                'message': 'Extracting audio from video...'
+            })
+            
             audio_path = os.path.join(upload_dir, "extracted_audio.mp3")
             wav_audio_path = os.path.join(upload_dir, "audio_for_speech.wav")
             
             extract_audio_from_video(video_path, audio_path)
             convert_audio_format(audio_path, wav_audio_path)
-            processing_status[upload_id]['progress'] = 20
+            
+            broadcast_status_update(upload_id, {
+                'status': 'processing',
+                'progress': 20,
+                'message': 'Audio extraction completed'
+            })
             
             # Step 2: Split audio (30% progress)
-            processing_status[upload_id]['message'] = 'Preparing audio chunks...'
+            broadcast_status_update(upload_id, {
+                'status': 'processing',
+                'progress': 25,
+                'message': 'Preparing audio chunks...'
+            })
+            
             chunks = split_audio(wav_audio_path, chunk_length_ms=15000, output_dir=upload_dir)
-            processing_status[upload_id]['progress'] = 30
+            
+            broadcast_status_update(upload_id, {
+                'status': 'processing',
+                'progress': 30,
+                'message': 'Audio chunks prepared'
+            })
             
             # Step 3: Process Tamil transcription (50% progress)
-            processing_status[upload_id]['message'] = 'Transcribing Tamil audio...'
+            broadcast_status_update(upload_id, {
+                'status': 'processing',
+                'progress': 35,
+                'message': 'Transcribing Tamil audio...'
+            })
+            
             pure_tamil_text = process_pure_tamil_from_audio(chunks)
-            processing_status[upload_id]['progress'] = 50
+            
+            broadcast_status_update(upload_id, {
+                'status': 'processing',
+                'progress': 50,
+                'message': 'Tamil transcription completed'
+            })
             
             # Step 4: Generate Tanglish (60% progress)
-            processing_status[upload_id]['message'] = 'Converting to Tanglish...'
+            broadcast_status_update(upload_id, {
+                'status': 'processing',
+                'progress': 55,
+                'message': 'Converting to Tanglish...'
+            })
+            
             if contains_tamil_script(pure_tamil_text):
                 romanized_tanglish = tamil_to_tanglish(pure_tamil_text)
             else:
                 romanized_tanglish = "Tamil transcription failed"
-            processing_status[upload_id]['progress'] = 60
+            
+            broadcast_status_update(upload_id, {
+                'status': 'processing',
+                'progress': 60,
+                'message': 'Tanglish conversion completed'
+            })
             
             # Step 5: English transcription (70% progress)
-            processing_status[upload_id]['message'] = 'Generating English translation...'
+            broadcast_status_update(upload_id, {
+                'status': 'processing',
+                'progress': 65,
+                'message': 'Generating English translation...'
+            })
+            
             english_text = transcribe_with_whisper(wav_audio_path, language="en")
             if not english_text and pure_tamil_text:
                 english_text = translate_text(pure_tamil_text, "ta", "en")
-            processing_status[upload_id]['progress'] = 70
+            
+            broadcast_status_update(upload_id, {
+                'status': 'processing',
+                'progress': 70,
+                'message': 'English translation completed'
+            })
             
             # Step 6: Standard Tamil translation (80% progress)
-            processing_status[upload_id]['message'] = 'Generating standard Tamil translation...'
+            broadcast_status_update(upload_id, {
+                'status': 'processing',
+                'progress': 75,
+                'message': 'Generating standard Tamil translation...'
+            })
+            
             standard_tamil_text = translate_text(english_text, "en", "ta") if english_text else ""
-            processing_status[upload_id]['progress'] = 80
+            
+            broadcast_status_update(upload_id, {
+                'status': 'processing',
+                'progress': 80,
+                'message': 'Standard Tamil translation completed'
+            })
             
             # Step 7: Generate SRT files (90% progress)
-            processing_status[upload_id]['message'] = 'Generating synchronized subtitle files...'
+            broadcast_status_update(upload_id, {
+                'status': 'processing',
+                'progress': 85,
+                'message': 'Generating synchronized subtitle files...'
+            })
+            
             results = {
                 'pure_tamil': pure_tamil_text,
                 'english': english_text,
@@ -122,10 +213,20 @@ def process_video_async(upload_id, app):
             }
             
             srt_files = generate_all_srt_files_improved(upload_dir, video_path, wav_audio_path, results)
-            processing_status[upload_id]['progress'] = 90
+            
+            broadcast_status_update(upload_id, {
+                'status': 'processing',
+                'progress': 90,
+                'message': 'Subtitle files generated'
+            })
             
             # Step 8: Create results file (100% progress)
-            processing_status[upload_id]['message'] = 'Finalizing results...'
+            broadcast_status_update(upload_id, {
+                'status': 'processing',
+                'progress': 95,
+                'message': 'Finalizing results...'
+            })
+            
             results_file = os.path.join(upload_dir, "results.txt")
             with open(results_file, "w", encoding="utf-8") as f:
                 f.write("===== TAMIL TRANSCRIPTION RESULTS =====\n\n")
@@ -139,7 +240,7 @@ def process_video_async(upload_id, app):
                 f.write(standard_tamil_text)
             
             # Complete
-            processing_status[upload_id] = {
+            broadcast_status_update(upload_id, {
                 'status': 'completed',
                 'progress': 100,
                 'message': 'Processing completed successfully',
@@ -151,14 +252,14 @@ def process_video_async(upload_id, app):
                     'standard_tamil': 'standard_tamil_subtitles.srt' if 'standard_tamil' in srt_files else None
                 },
                 'srt_count': len(srt_files)
-            }
+            })
             
         except Exception as e:
-            processing_status[upload_id] = {
+            broadcast_status_update(upload_id, {
                 'status': 'error',
                 'progress': 0,
                 'message': f'Processing failed: {str(e)}'
-            }
+            })
 
 @api_bp.route('/process/<upload_id>', methods=['POST'])
 def process_video(upload_id):
@@ -180,7 +281,7 @@ def process_video(upload_id):
         if upload_id in processing_status and processing_status[upload_id]['status'] == 'completed':
             return jsonify(processing_status[upload_id]), 200
         
-        # Start async processing - Pass the app instance to the thread
+        # Start async processing
         thread = threading.Thread(target=process_video_async, args=(upload_id, current_app._get_current_object()))
         thread.daemon = True
         thread.start()
@@ -188,7 +289,7 @@ def process_video(upload_id):
         return jsonify({
             'status': 'processing_started',
             'upload_id': upload_id,
-            'message': 'Video processing started. Use /status endpoint to check progress.'
+            'message': 'Video processing started. Connect to /status-stream endpoint for real-time updates.'
         })
         
     except Exception as e:
@@ -197,23 +298,75 @@ def process_video(upload_id):
             'message': str(e)
         }), 500
 
+@api_bp.route('/status-stream/<upload_id>')
+def status_stream(upload_id):
+    """
+    Server-Sent Events endpoint for real-time status updates
+    """
+    def event_generator():
+        # Create a queue for this client
+        client_queue = queue.Queue()
+        
+        # Register this client for the upload_id
+        sse_clients[upload_id].append(client_queue)
+        
+        try:
+            # Send current status immediately if available
+            if upload_id in processing_status:
+                current_status = processing_status[upload_id]
+                yield f"data: {json.dumps(current_status)}\n\n"
+            
+            # Listen for updates
+            while True:
+                try:
+                    # Wait for status update (with timeout to send keepalive)
+                    status_data = client_queue.get(timeout=30)
+                    yield f"data: {json.dumps(status_data)}\n\n"
+                    
+                    # If processing is complete or failed, close the connection
+                    if status_data.get('status') in ['completed', 'error']:
+                        break
+                        
+                except queue.Empty:
+                    # Send keepalive
+                    yield f"data: {json.dumps({'keepalive': True})}\n\n"
+                    
+        except GeneratorExit:
+            # Client disconnected
+            pass
+        finally:
+            # Remove client from list
+            if client_queue in sse_clients[upload_id]:
+                sse_clients[upload_id].remove(client_queue)
+    
+    return Response(
+        event_generator(),
+        mimetype='text/event-stream',
+        headers={
+            'Cache-Control': 'no-cache',
+            'Connection': 'keep-alive',
+            'Access-Control-Allow-Origin': '*',
+            'Access-Control-Allow-Headers': 'Cache-Control'
+        }
+    )
+
 @api_bp.route('/status/<upload_id>', methods=['GET'])
 def get_processing_status(upload_id):
     """
-    Endpoint to check processing status
+    Endpoint to check processing status (fallback for non-SSE clients)
     """
     if upload_id not in processing_status:
         return jsonify({'error': 'No processing found for this upload ID'}), 404
     
     return jsonify(processing_status[upload_id])
 
+# ... (rest of the endpoints remain the same)
 @api_bp.route('/download/<upload_id>', methods=['GET'])
 def download_results(upload_id):
     """
     Endpoint to download the results text file
     """
     try:
-        # Get the results file
         upload_dir = os.path.join(current_app.config['UPLOAD_FOLDER'], upload_id)
         results_file = os.path.join(upload_dir, "results.txt")
         
@@ -364,9 +517,11 @@ def cleanup(upload_id):
         
         cleanup_temp_files([upload_dir])
         
-        # Remove from processing status
+        # Remove from processing status and SSE clients
         if upload_id in processing_status:
             del processing_status[upload_id]
+        if upload_id in sse_clients:
+            del sse_clients[upload_id]
         
         return jsonify({
             'status': 'success',
