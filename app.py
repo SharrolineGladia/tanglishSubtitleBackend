@@ -290,3 +290,6 @@ def run_app():
 
 if __name__ == '__main__':
     run_app()
+
+application = create_app()
+app = application
