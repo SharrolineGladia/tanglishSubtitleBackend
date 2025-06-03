@@ -118,7 +118,7 @@ def run_app():
     logger.info("Models are loading in the background. Check /api/models for status.")
     
     # For production deployment on Fly.io
-    port = int(os.environ.get('PORT', app.config.get('PORT', 8080)))
+    port = int(os.environ.get('PORT', app.config.get('PORT', 7860)))
     host = os.environ.get('HOST', app.config.get('HOST', '0.0.0.0'))
     debug = os.environ.get('FLASK_ENV') != 'production'
     
